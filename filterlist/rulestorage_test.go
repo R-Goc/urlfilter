@@ -1,6 +1,7 @@
 package filterlist_test
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/AdguardTeam/golibs/testutil"
@@ -115,6 +116,92 @@ func TestRuleStorage_invalid(t *testing.T) {
 		filterlist.NewString(conf),
 	})
 	testutil.AssertErrorMsg(t, `at index 1: id: duplicated value: 1`, err)
+}
+
+func TestRuleStorage_boundedCache(t *testing.T) {
+	t.Parallel()
+
+	// Build a list with more rules than the configured cache size to exercise
+	// 8-way set-associative CLOCK eviction and concurrent retrieval under -race.
+	const numRules = 2000
+	var b []byte
+	for i := range numRules {
+		b = append(b, "||domain"...)
+		b = append(b, byte('a'+i%26), byte('a'+(i/26)%26), byte('a'+(i/676)%26))
+		b = append(b, ".example^\n"...)
+	}
+
+	l := filterlist.NewBytes(&filterlist.BytesConfig{
+		RulesText: b,
+		ID:        uftest.ListID1,
+	})
+	storage, err := filterlist.NewRuleStorageWithConfig(&filterlist.RuleStorageConfig{
+		Lists:     []filterlist.Interface{l},
+		CacheSize: 256,
+	})
+	require.NoError(t, err)
+
+	var ids []filterlist.StorageID
+	var wantText []string
+	sc := storage.NewRuleStorageScanner()
+	for sc.Scan() {
+		r, id := sc.Rule()
+		ids = append(ids, id)
+		wantText = append(wantText, r.Text())
+	}
+	require.Len(t, ids, numRules)
+
+	// Retrieve every rule concurrently across multiple goroutines to exercise
+	// CLOCK eviction and concurrent load/store under -race, verifying exact
+	// rule identity (zero false positives).
+	var wg sync.WaitGroup
+	for g := range 4 {
+		wg.Add(1)
+		go func(offset int) {
+			defer wg.Done()
+
+			for i := range len(ids) {
+				idx := (i + offset*500) % len(ids)
+				r, retrieveErr := storage.RetrieveRule(ids[idx])
+				if assert.NoError(t, retrieveErr) && assert.NotNil(t, r) {
+					assert.Equal(t, wantText[idx], r.Text())
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	// Zero StorageID (listID=0, ruleIdx=0) must not collide with empty slots.
+	zeroList := filterlist.NewString(&filterlist.StringConfig{
+		RulesText: "||zero.example^\n",
+		ID:        rules.ListID(0),
+	})
+	zeroStorage, err := filterlist.NewRuleStorageWithConfig(&filterlist.RuleStorageConfig{
+		Lists:     []filterlist.Interface{zeroList},
+		CacheSize: 0, // default size
+	})
+	require.NoError(t, err)
+	zeroID := filterlist.NewStorageID(rules.ListID(0), 0)
+	r, err := zeroStorage.RetrieveRule(zeroID)
+	require.NoError(t, err)
+	require.NotNil(t, r)
+	assert.Equal(t, "||zero.example^", r.Text())
+	// Second retrieval exercises cache hit on StorageID{0, 0}.
+	r, err = zeroStorage.RetrieveRule(zeroID)
+	require.NoError(t, err)
+	require.NotNil(t, r)
+	assert.Equal(t, "||zero.example^", r.Text())
+
+	// Negative CacheSize disables caching while still retrieving rules cleanly.
+	noCache, err := filterlist.NewRuleStorageWithConfig(&filterlist.RuleStorageConfig{
+		Lists:     []filterlist.Interface{l},
+		CacheSize: -1,
+	})
+	require.NoError(t, err)
+	r, err = noCache.RetrieveRule(ids[0])
+	require.NoError(t, err)
+	require.NotNil(t, r)
+	assert.Equal(t, wantText[0], r.Text())
 }
 
 func BenchmarkStorage_RetrieveRule(b *testing.B) {
