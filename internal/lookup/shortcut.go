@@ -18,8 +18,58 @@ import (
 // shortcutLength is the fixed length used to form URL "shortcuts".
 const shortcutLength = 5
 
-// shortcut is a single shortcut.
-type shortcut string
+// shortcut is a fixed-length 5-byte shortcut packed big-endian into the lower
+// 40 bits of a uint64.  Using uint64 avoids pinning the original rule string,
+// enables Go's mapaccess2_fast64 fast path, and preserves lexicographical byte
+// ordering under numeric comparison.
+type shortcut uint64
+
+// packShortcut packs 5 bytes from s[i:i+5] big-endian into a [shortcut].
+// Callers must ensure i+shortcutLength <= len(s).
+func packShortcut(s string, i int) (sc shortcut) {
+	return shortcut(uint64(s[i])<<32 |
+		uint64(s[i+1])<<24 |
+		uint64(s[i+2])<<16 |
+		uint64(s[i+3])<<8 |
+		uint64(s[i+4]))
+}
+
+// packShortcutBytes packs a 5-byte slice big-endian into a [shortcut].
+func packShortcutBytes(b []byte) (sc shortcut) {
+	return shortcut(uint64(b[0])<<32 |
+		uint64(b[1])<<24 |
+		uint64(b[2])<<16 |
+		uint64(b[3])<<8 |
+		uint64(b[4]))
+}
+
+// bytes unpacks sc into a 5-byte array.
+func (sc shortcut) bytes() (b [shortcutLength]byte) {
+	// #nosec G115 -- Intentional byte extraction from packed 40-bit value.
+	return [shortcutLength]byte{
+		byte(sc >> 32),
+		byte(sc >> 24),
+		byte(sc >> 16),
+		byte(sc >> 8),
+		byte(sc),
+	}
+}
+
+// shortcutBucket stores the head index and length of a shortcut's rule list
+// inside [ShortcutIndex.nodes].
+type shortcutBucket struct {
+	// head is the 1-based index of the first node in [ShortcutIndex.nodes].
+	head uint32
+
+	// len is the number of rules in this bucket.
+	len uint32
+}
+
+// shortcutNode is a single pointer-free entry in [ShortcutIndex.nodes].
+type shortcutNode struct {
+	id   filterlist.StorageID
+	next uint32
+}
 
 // ShortcutIndex is an index that relies on the rule shortcuts to quickly find
 // matching rules:
@@ -28,7 +78,7 @@ type shortcut string
 //     characters; this string is the [shortcut].
 //  2. It uses a sliding window of [shortcutLength] and puts it into its map.
 //  3. When it matches a request, it takes all substrings of length
-//     [shortcutsLength] from it and checks if there are any rules in the map.
+//     [shortcutLength] from it and checks if there are any rules in the map.
 //
 // NOTE: only the rules with a shortcut are eligible for this index.
 //
@@ -37,8 +87,13 @@ type ShortcutIndex struct {
 	// shortcutsPool contains slices of shortcuts for reuse.
 	shortcutsPool *syncutil.Pool[[]shortcut]
 
-	// shortcuts is the index of a shortcut to its data.
-	shortcuts map[shortcut][]filterlist.StorageID
+	// shortcuts maps a 5-byte shortcut to its bucket in nodes.  Both key and
+	// value are pointer-free so Go's GC marks the map noscan.
+	shortcuts map[shortcut]shortcutBucket
+
+	// nodes is a flat, pointer-free arena of linked-list nodes holding rule
+	// IDs.
+	nodes []shortcutNode
 }
 
 // shortcutsInARuleEst is the estimate for the number of shortcuts in a rule
@@ -49,7 +104,21 @@ const shortcutsInARuleEst = 16
 func NewShortcutIndex() (idx *ShortcutIndex) {
 	return &ShortcutIndex{
 		shortcutsPool: syncutil.NewSlicePool[shortcut](shortcutsInARuleEst),
-		shortcuts:     map[shortcut][]filterlist.StorageID{},
+		shortcuts:     map[shortcut]shortcutBucket{},
+	}
+}
+
+// insertID prepends id to the bucket for sc.
+func (idx *ShortcutIndex) insertID(sc shortcut, id filterlist.StorageID) {
+	b := idx.shortcuts[sc]
+	idx.nodes = append(idx.nodes, shortcutNode{
+		id:   id,
+		next: b.head,
+	})
+	// #nosec G115 -- Node count is bounded by memory.
+	idx.shortcuts[sc] = shortcutBucket{
+		head: uint32(len(idx.nodes)),
+		len:  b.len + 1,
 	}
 }
 
@@ -64,23 +133,21 @@ func (idx *ShortcutIndex) Add(r *rules.NetworkRule, id filterlist.StorageID) (ok
 	}
 
 	var minSC shortcut
-	minLen := uint64(math.MaxUint64)
+	minLen := uint32(math.MaxUint32)
 	for _, sc := range *shortcutsPtr {
-		scIDs := idx.shortcuts[sc]
-
-		if scIDs == nil {
+		b, exists := idx.shortcuts[sc]
+		if !exists {
 			minSC = sc
 			break
 		}
 
-		lenSCIds := uint64(len(scIDs))
-		if lenSCIds < minLen {
-			minLen = lenSCIds
+		if b.len < minLen {
+			minLen = b.len
 			minSC = sc
 		}
 	}
 
-	idx.shortcuts[minSC] = append(idx.shortcuts[minSC], id)
+	idx.insertID(minSC, id)
 
 	return true
 }
@@ -98,8 +165,9 @@ func appendRuleShortcuts(orig []shortcut, r *rules.NetworkRule) (res []shortcut)
 		return res
 	}
 
-	for i := range len(r.Shortcut) - shortcutLength {
-		res = append(res, shortcut(r.Shortcut[i:i+shortcutLength]))
+	s := r.Shortcut
+	for i := range len(s) - shortcutLength {
+		res = append(res, packShortcut(s, i))
 	}
 
 	return res
@@ -157,15 +225,21 @@ func (idx *ShortcutIndex) AppendBinary(orig []byte) (res []byte, err error) {
 
 	res = enc.EncodeMapStart(res, uint64(len(idx.shortcuts)))
 	for _, sc := range slices.Sorted(maps.Keys(idx.shortcuts)) {
-		res = enc.EncodeBytes(res, []byte(sc))
+		scBytes := sc.bytes()
+		res = enc.EncodeBytes(res, scBytes[:])
 
-		ids := idx.shortcuts[sc]
-		res = enc.EncodeArrayStart(res, uint64(len(ids)))
-		for i, id := range ids {
-			res, err = id.AppendBinary(res)
+		b := idx.shortcuts[sc]
+		res = enc.EncodeArrayStart(res, uint64(b.len))
+
+		i := 0
+		for nodeIdx := b.head; nodeIdx != 0; i++ {
+			n := idx.nodes[nodeIdx-1]
+			res, err = n.id.AppendBinary(res)
 			if err != nil {
-				return res, fmt.Errorf("shortcut %q: encoding id at index %d: %w", sc, i, err)
+				return res, fmt.Errorf("shortcut %q: encoding id at index %d: %w", scBytes[:], i, err)
 			}
+
+			nodeIdx = n.next
 		}
 	}
 
@@ -180,19 +254,25 @@ func (idx *ShortcutIndex) AppendMatching(
 ) (res []filterlist.StorageID) {
 	res = orig
 
-	l := len(r.URLLowerCase)
+	s := r.URLLowerCase
+	l := len(s)
 	if l < shortcutLength {
 		return res
 	}
 
 	for i := range l - shortcutLength {
-		sc := shortcut(r.URLLowerCase[i : i+shortcutLength])
-		ids := idx.shortcuts[sc]
-		if len(ids) == 0 {
+		b, ok := idx.shortcuts[packShortcut(s, i)]
+		if !ok {
 			continue
 		}
 
-		res = append(res, ids...)
+		start := len(res)
+		for nodeIdx := b.head; nodeIdx != 0; {
+			n := idx.nodes[nodeIdx-1]
+			res = append(res, n.id)
+			nodeIdx = n.next
+		}
+		slices.Reverse(res[start:])
 	}
 
 	return res
@@ -201,6 +281,7 @@ func (idx *ShortcutIndex) AppendMatching(
 // Reset prepares idx for reuse.
 func (idx *ShortcutIndex) Reset() {
 	clear(idx.shortcuts)
+	idx.nodes = idx.nodes[:0]
 }
 
 // type check
@@ -229,14 +310,29 @@ func (idx *ShortcutIndex) UnmarshalBinaryRest(b []byte) (rest []byte, err error)
 	l, rest := dec.DecodeMapStart(rest)
 
 	var keyBuffer []byte
-	idx.shortcuts = make(map[shortcut][]filterlist.StorageID, l)
+	var idsBuf []filterlist.StorageID
+	idx.shortcuts = make(map[shortcut]shortcutBucket, l)
+	idx.nodes = idx.nodes[:0]
+
 	for range l {
 		keyBuffer, rest = dec.AppendBytes(keyBuffer[:0], rest)
+		if err = dec.Err(); err != nil {
+			return b, err
+		}
+
+		if len(keyBuffer) != shortcutLength {
+			return b, fmt.Errorf("decoding shortcut %q: invalid length %d", keyBuffer, len(keyBuffer))
+		}
+
+		sc := packShortcutBytes(keyBuffer)
 
 		var idsLen uint64
 		idsLen, rest = dec.DecodeArrayStart(rest)
+		if err = dec.Err(); err != nil {
+			return b, err
+		}
 
-		ids := make([]filterlist.StorageID, 0, idsLen)
+		idsBuf = idsBuf[:0]
 		for i := range idsLen {
 			var id filterlist.StorageID
 			rest, err = id.UnmarshalBinaryRest(rest)
@@ -244,10 +340,15 @@ func (idx *ShortcutIndex) UnmarshalBinaryRest(b []byte) (rest []byte, err error)
 				return b, fmt.Errorf("decoding shortcut %q: id at index %d: %w", keyBuffer, i, err)
 			}
 
-			ids = append(ids, id)
+			idsBuf = append(idsBuf, id)
 		}
 
-		idx.shortcuts[shortcut(keyBuffer)] = ids
+		// Overwrite any prior bucket for duplicate keys, and insert in reverse
+		// so head-to-tail traversal matches the encoded order.
+		delete(idx.shortcuts, sc)
+		for i := len(idsBuf) - 1; i >= 0; i-- {
+			idx.insertID(sc, idsBuf[i])
+		}
 	}
 
 	err = dec.Err()
