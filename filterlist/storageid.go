@@ -25,6 +25,16 @@ func NewStorageID(listID rules.ListID, ruleIdx int64) (id StorageID) {
 	}
 }
 
+// ListID returns the rule-list identifier of id.
+func (id StorageID) ListID() (listID rules.ListID) {
+	return id.listID
+}
+
+// RuleIdx returns the rule-list index of id.
+func (id StorageID) RuleIdx() (ruleIdx int64) {
+	return id.ruleIdx
+}
+
 // type check
 var _ encoding.BinaryAppender = StorageID{}
 
