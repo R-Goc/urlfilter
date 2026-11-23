@@ -1,6 +1,7 @@
 package filterlist_test
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/AdguardTeam/golibs/testutil"
@@ -115,6 +116,53 @@ func TestRuleStorage_invalid(t *testing.T) {
 		filterlist.NewString(conf),
 	})
 	testutil.AssertErrorMsg(t, `at index 1: id: duplicated value: 1`, err)
+}
+
+func TestRuleStorage_boundedCache(t *testing.T) {
+	t.Parallel()
+
+	// Build a list with more rules than defaultRuleCacheSize (8192) to exercise
+	// cache eviction and concurrent retrieval under -race.
+	const numRules = 9000
+	var b []byte
+	for i := range numRules {
+		b = append(b, "||domain"...)
+		b = append(b, byte('a'+i%26), byte('a'+(i/26)%26), byte('a'+(i/676)%26))
+		b = append(b, ".example^\n"...)
+	}
+
+	l := filterlist.NewBytes(&filterlist.BytesConfig{
+		RulesText: b,
+		ID:        uftest.ListID1,
+	})
+	storage, err := filterlist.NewRuleStorage([]filterlist.Interface{l})
+	require.NoError(t, err)
+
+	var ids []filterlist.StorageID
+	sc := storage.NewRuleStorageScanner()
+	for sc.Scan() {
+		_, id := sc.Rule()
+		ids = append(ids, id)
+	}
+	require.Len(t, ids, numRules)
+
+	// Retrieve every rule concurrently across multiple goroutines to exercise
+	// CLOCK eviction and concurrent load/store under -race.
+	var wg sync.WaitGroup
+	for g := range 4 {
+		wg.Add(1)
+		go func(offset int) {
+			defer wg.Done()
+
+			for i := range len(ids) {
+				id := ids[(i+offset*1000)%len(ids)]
+				r, retrieveErr := storage.RetrieveRule(id)
+				require.NoError(t, retrieveErr)
+				require.NotNil(t, r)
+			}
+		}(g)
+	}
+	wg.Wait()
 }
 
 func BenchmarkStorage_RetrieveRule(b *testing.B) {
