@@ -160,6 +160,31 @@ func TestShortcutIndex_AppendMatching(t *testing.T) {
 			assertMatch(t, idx, r, tc.wantID)
 		})
 	}
+
+	t.Run("multi_rule_fifo_order", func(t *testing.T) {
+		t.Parallel()
+
+		// Two rules sharing the same 6-char shortcut must be returned in FIFO
+		// insertion order both before and after binary round-trip.
+		rulesText := "||abcdef^$script\n||abcdef^$image\n"
+		sMulti := newStorage(t, rulesText)
+		idxMulti := lookup.NewShortcutIndex()
+		loadIndex(t, idxMulti, sMulti)
+
+		r := rules.NewRequestForHostname("abcdef")
+		want := []filterlist.StorageID{
+			filterlist.NewStorageID(1, 0),
+			filterlist.NewStorageID(1, 17),
+		}
+		assert.Equal(t, want, idxMulti.AppendMatching(nil, r))
+
+		data, err := idxMulti.AppendBinary(nil)
+		require.NoError(t, err)
+
+		decoded := lookup.NewShortcutIndex()
+		require.NoError(t, decoded.UnmarshalBinary(data))
+		assert.Equal(t, want, decoded.AppendMatching(nil, r))
+	})
 }
 
 func BenchmarkShortcutIndex_AppendMatching(b *testing.B) {
