@@ -79,6 +79,40 @@ func TestRuleScanner_longLine(t *testing.T) {
 	assert.False(t, scanner.Scan())
 }
 
+func TestRuleScanner_ScanFast(t *testing.T) {
+	t.Parallel()
+
+	content := strings.Join([]string{
+		"! comment",
+		"# hash comment",
+		"  ||simple.example^  ",
+		"@@||allow.example^",
+		"||unsupported.example^$all",
+		"example.org##.ad",
+		"||modifier.example^$important",
+	}, "\n")
+
+	s := filterlist.NewRuleScanner(strings.NewReader(content), uftest.ListID1, true)
+
+	var simpleDomains []string
+	var parsedRules []string
+	for {
+		dom, r, listID, _, ok := s.ScanFast()
+		if !ok {
+			break
+		}
+		assert.Equal(t, uftest.ListID1, listID)
+		if dom != nil {
+			simpleDomains = append(simpleDomains, string(dom))
+		} else {
+			parsedRules = append(parsedRules, r.Text())
+		}
+	}
+
+	assert.Equal(t, []string{"simple.example", "allow.example"}, simpleDomains)
+	assert.Equal(t, []string{"||modifier.example^$important"}, parsedRules)
+}
+
 func BenchmarkRuleScanner_Scan(b *testing.B) {
 	r := strings.NewReader(testRuleText)
 	s := filterlist.NewRuleScanner(r, uftest.ListID1, false)

@@ -148,6 +148,23 @@ func (s *RuleStorage) SizeEstimate() (est datasize.ByteSize) {
 	return s.sizeEst
 }
 
+// ListCount returns the number of rule lists in the storage.
+func (s *RuleStorage) ListCount() (n int) {
+	return len(s.lists)
+}
+
+// MaxListSizeEstimate returns the maximum size estimate among all rule lists in
+// the storage.
+func (s *RuleStorage) MaxListSizeEstimate() (est datasize.ByteSize) {
+	for _, l := range s.lists {
+		if lEst := l.SizeEstimate(); lEst > est {
+			est = lEst
+		}
+	}
+
+	return est
+}
+
 // Close closes the storage instance.
 func (s *RuleStorage) Close() (err error) {
 	if len(s.lists) == 0 {

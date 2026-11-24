@@ -2,6 +2,7 @@ package filterlist
 
 import (
 	"bufio"
+	"bytes"
 	"io"
 
 	"github.com/AdguardTeam/urlfilter/rules"
@@ -65,28 +66,105 @@ func (s *RuleScanner) Rule() (r rules.Rule, idx int64) {
 	return s.currentRule, s.currentRuleIndex
 }
 
-// readNextLine reads the next line and returns it and the index of the
-// beginning of the string.
-func (s *RuleScanner) readNextLine() (line string, idx int64, err error) {
+// CountSimpleDomains scans s to EOF and returns the number of pure simple
+// domain rules ("||domain^" / "@@||domain^") without allocating rules.
+func (s *RuleScanner) CountSimpleDomains() (n int) {
+	for {
+		chunk, _, err := s.readNextLineBytes()
+		if err != nil {
+			return n
+		}
+
+		trimmed := bytes.TrimSpace(chunk)
+		if len(trimmed) == 0 || trimmed[0] == '!' {
+			continue
+		}
+
+		if trimmed[0] == '#' {
+			// Skip non-cosmetic '#' comment lines without allocating a string.
+			if len(trimmed) == 1 {
+				continue
+			}
+			switch trimmed[1] {
+			case '#', '@', '?', '$', '%':
+			default:
+				continue
+			}
+		}
+
+		if _, ok := parseSimpleDomainRuleBytes(trimmed); ok {
+			n++
+		}
+	}
+}
+
+// ScanFast advances s to the next rule, returning either a zero-allocation
+// simple pure-domain slice (for "||domain^" or "@@||domain^" lines) or a parsed
+// [rules.Rule].  The returned simpleDomain slice is only valid until the next
+// scan call.
+func (s *RuleScanner) ScanFast() (
+	simpleDomain []byte,
+	rule rules.Rule,
+	listID rules.ListID,
+	idx int64,
+	ok bool,
+) {
+	for {
+		chunk, lineIdx, err := s.readNextLineBytes()
+		if err != nil {
+			return nil, nil, 0, 0, false
+		}
+
+		trimmed := bytes.TrimSpace(chunk)
+		if len(trimmed) == 0 || trimmed[0] == '!' {
+			continue
+		}
+
+		if trimmed[0] == '#' {
+			// Skip non-cosmetic '#' comment lines without allocating a string.
+			if len(trimmed) == 1 {
+				continue
+			}
+			switch trimmed[1] {
+			case '#', '@', '?', '$', '%':
+			default:
+				continue
+			}
+		}
+
+		if dom, isSimple := parseSimpleDomainRuleBytes(trimmed); isSimple {
+			return dom, nil, s.listID, lineIdx, true
+		}
+
+		r, parseErr := rules.NewRule(string(trimmed), s.listID)
+		if r != nil && parseErr == nil && !s.isIgnored(r) {
+			return nil, r, s.listID, lineIdx, true
+		}
+	}
+}
+
+// readNextLineBytes reads the next line using ReadSlice to avoid allocating a
+// byte slice copy on the common path.
+func (s *RuleScanner) readNextLineBytes() (chunk []byte, idx int64, err error) {
 	lineIndex := s.currentPos
 
-	chunk, err := s.reader.ReadSlice('\n')
+	chunk, err = s.reader.ReadSlice('\n')
 	if err != bufio.ErrBufferFull {
 		if err != nil && err != io.EOF {
-			return "", lineIndex, err
+			return nil, lineIndex, err
 		}
 
 		if len(chunk) > 0 {
 			s.currentPos += int64(len(chunk))
 
-			return string(chunk), lineIndex, nil
+			return chunk, lineIndex, nil
 		}
 
 		if err != nil {
-			return "", lineIndex, io.EOF
+			return nil, lineIndex, io.EOF
 		}
 
-		return "", lineIndex, nil
+		return nil, lineIndex, nil
 	}
 
 	full := make([]byte, len(chunk), len(chunk)*2)
@@ -97,12 +175,66 @@ func (s *RuleScanner) readNextLine() (line string, idx int64, err error) {
 	}
 
 	if err != nil && err != io.EOF {
-		return "", lineIndex, err
+		return nil, lineIndex, err
 	}
 
 	s.currentPos += int64(len(full))
 
-	return string(full), lineIndex, nil
+	return full, lineIndex, nil
+}
+
+// parseSimpleDomainRuleBytes checks whether line is a pure domain rule of the
+// form "||<domain>^" or "@@||<domain>^" containing only ASCII domain characters
+// and at least one dot.
+func parseSimpleDomainRuleBytes(line []byte) (domain []byte, ok bool) {
+	// Optional allowlist prefix: "@@".
+	b, _ := bytes.CutPrefix(line, []byte("@@"))
+
+	// Required domain-anchor prefix: "||".
+	b, ok = bytes.CutPrefix(b, []byte("||"))
+	if !ok {
+		return nil, false
+	}
+
+	// Required separator suffix: "^".
+	b, ok = bytes.CutSuffix(b, []byte("^"))
+	if !ok || len(b) == 0 {
+		return nil, false
+	}
+
+	hasDot := false
+	for _, c := range b {
+		if c == '.' {
+			hasDot = true
+
+			continue
+		}
+
+		isValid := (c >= 'a' && c <= 'z') ||
+			(c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') ||
+			c == '-' || c == '_'
+		if !isValid {
+			return nil, false
+		}
+	}
+
+	if !hasDot {
+		return nil, false
+	}
+
+	return b, true
+}
+
+// readNextLine reads the next line and returns it and the index of the
+// beginning of the string.
+func (s *RuleScanner) readNextLine() (line string, idx int64, err error) {
+	chunk, idx, err := s.readNextLineBytes()
+	if err != nil {
+		return "", idx, err
+	}
+
+	return string(chunk), idx, nil
 }
 
 // isIgnored checks if the rule should be ignored by this scanner.

@@ -59,3 +59,46 @@ func (s *RuleStorageScanner) Rule() (r rules.Rule, id StorageID) {
 
 	return f, NewStorageID(rules.ListID(f.GetFilterListID()), idx)
 }
+
+// CountSimpleDomains counts pure simple domain rules across all underlying
+// scanners without allocating rules.
+func (s *RuleStorageScanner) CountSimpleDomains() (n int) {
+	for _, sc := range s.Scanners {
+		n += sc.CountSimpleDomains()
+	}
+
+	return n
+}
+
+// ScanFast advances s to the next rule across all underlying scanners using
+// [RuleScanner.ScanFast].
+func (s *RuleStorageScanner) ScanFast() (
+	simpleDomain []byte,
+	rule rules.Rule,
+	listID rules.ListID,
+	ruleIdx int64,
+	ok bool,
+) {
+	if len(s.Scanners) == 0 {
+		return nil, nil, 0, 0, false
+	}
+
+	if s.currentScanner == nil {
+		s.currentScannerIdx = 0
+		s.currentScanner = s.Scanners[s.currentScannerIdx]
+	}
+
+	for {
+		simpleDomain, rule, listID, ruleIdx, ok = s.currentScanner.ScanFast()
+		if ok {
+			return simpleDomain, rule, listID, ruleIdx, true
+		}
+
+		if s.currentScannerIdx == len(s.Scanners)-1 {
+			return nil, nil, 0, 0, false
+		}
+
+		s.currentScannerIdx++
+		s.currentScanner = s.Scanners[s.currentScannerIdx]
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"github.com/AdguardTeam/golibs/container"
 	"github.com/AdguardTeam/golibs/syncutil"
 	"github.com/AdguardTeam/urlfilter/filterlist"
+	"github.com/AdguardTeam/urlfilter/internal/lookup"
 	"github.com/AdguardTeam/urlfilter/rules"
 )
 
@@ -14,6 +15,14 @@ import (
 type DNSEngine struct {
 	// ruleIndex is a map for hosts mapped to the list of rule indexes.
 	ruleIndex map[string][]filterlist.StorageID
+
+	// simpleDomains indexes pure domain rules ("||domain^", "@@||domain^") in a
+	// compact pointer-free hash table.
+	simpleDomains *lookup.SimpleDomainIndex
+
+	// simpleIDsPool reuses candidate StorageID slices for simpleDomains
+	// lookups.
+	simpleIDsPool *syncutil.Pool[[]filterlist.StorageID]
 
 	// networkEngine is the network engine constructed from the network rules.
 	networkEngine *NetworkEngine
@@ -31,29 +40,54 @@ type DNSEngine struct {
 	rulesCount uint64
 }
 
-// bytesPerRuleEst is the estimate of how many bytes a single rule generally
-// takes.  It is based on the AdGuard Base DNS list.
-const bytesPerRuleEst = 64
-
 // NewDNSEngine parses the specified filter lists and returns a *DNSEngine built
 // from them.  s must not be nil.
 func NewDNSEngine(s *filterlist.RuleStorage) (e *DNSEngine) {
-	numRulesEst := s.SizeEstimate() / bytesPerRuleEst
-
 	e = &DNSEngine{
-		rulesStorage: s,
-		ruleIndex:    make(map[string][]filterlist.StorageID, numRulesEst),
-		rulesCount:   0,
-		reqPool:      syncutil.NewPool(func() (v *rules.Request) { return &rules.Request{} }),
-		rulesPool:    syncutil.NewSlicePool[*rules.HostRule](1),
+		rulesStorage:  s,
+		simpleIDsPool: syncutil.NewSlicePool[filterlist.StorageID](1),
+		rulesCount:    0,
+		reqPool:       syncutil.NewPool(func() (v *rules.Request) { return &rules.Request{} }),
+		rulesPool:     syncutil.NewSlicePool[*rules.HostRule](1),
+	}
+
+	// Pass 1: count simple domain rules without allocating so SimpleDomainIndex
+	// can be allocated once at its exact final size.
+	if simpleCount := s.NewRuleStorageScanner().CountSimpleDomains(); simpleCount > 0 {
+		e.simpleDomains = lookup.NewSimpleDomainIndex(
+			simpleCount,
+			s.ListCount(),
+			s.MaxListSizeEstimate(),
+		)
 	}
 
 	netEng := NewNetworkEngineSkipStorageScan(s)
 	set := container.NewMapSet[string]()
 
 	scanner := s.NewRuleStorageScanner()
-	for scanner.Scan() {
-		f, id := scanner.Rule()
+	for {
+		dom, f, listID, ruleIdx, ok := scanner.ScanFast()
+		if !ok {
+			break
+		}
+
+		if dom != nil {
+			if e.simpleDomains != nil && e.simpleDomains.AddBytes(dom, listID, ruleIdx) {
+				e.rulesCount++
+
+				continue
+			}
+
+			// Fallback if ruleIdx, list count, or capacity exceeds
+			// SimpleDomainIndex limits.
+			var err error
+			f, err = s.RetrieveRule(filterlist.NewStorageID(listID, ruleIdx))
+			if err != nil || f == nil {
+				continue
+			}
+		}
+
+		id := filterlist.NewStorageID(listID, ruleIdx)
 		switch f := f.(type) {
 		case *rules.HostRule:
 			e.addRule(f, id)
@@ -118,15 +152,46 @@ func (e *DNSEngine) MatchRequestInto(req *DNSRequest, res *DNSResult) (matched b
 		return false
 	}
 
-	r := e.getRequestFromPool(req)
-	defer e.reqPool.Put(r)
+	var idsPtr *[]filterlist.StorageID
+	var simpleIDs []filterlist.StorageID
+	if e.simpleDomains != nil {
+		idsPtr = e.simpleIDsPool.Get()
+		*idsPtr = e.simpleDomains.AppendMatching((*idsPtr)[:0], req.Hostname)
+		simpleIDs = *idsPtr
+	}
 
-	res.NetworkRules = e.networkEngine.AppendAllMatching(res.NetworkRules, r)
-	resultRule := rules.GetDNSBasicRule(res.NetworkRules)
-	if resultRule != nil {
-		res.NetworkRule = resultRule
+	if len(simpleIDs) > 0 || e.networkEngine.RulesCount() > 0 {
+		r := e.getRequestFromPool(req)
+		defer e.reqPool.Put(r)
 
-		return true
+		for _, id := range simpleIDs {
+			nr := e.rulesStorage.RetrieveNetworkRule(id)
+			if nr != nil && nr.Match(r) {
+				res.NetworkRules = append(res.NetworkRules, nr)
+			}
+		}
+
+		if idsPtr != nil {
+			e.simpleIDsPool.Put(idsPtr)
+			idsPtr = nil
+		}
+
+		if e.networkEngine.RulesCount() > 0 {
+			res.NetworkRules = e.networkEngine.AppendAllMatching(res.NetworkRules, r)
+		}
+
+		resultRule := rules.GetDNSBasicRule(res.NetworkRules)
+		if resultRule != nil {
+			res.NetworkRule = resultRule
+
+			return true
+		}
+	} else if idsPtr != nil {
+		e.simpleIDsPool.Put(idsPtr)
+	}
+
+	if len(e.ruleIndex) == 0 {
+		return false
 	}
 
 	hostRulesPtr := e.rulesPool.Get()
@@ -172,8 +237,12 @@ func (e *DNSEngine) appendFromIndex(
 	return res
 }
 
-// addRule adds rule to the index
+// addRule adds rule to the index.
 func (e *DNSEngine) addRule(hostRule *rules.HostRule, id filterlist.StorageID) {
+	if e.ruleIndex == nil {
+		e.ruleIndex = map[string][]filterlist.StorageID{}
+	}
+
 	for _, hostname := range hostRule.Hostnames {
 		e.ruleIndex[hostname] = append(e.ruleIndex[hostname], id)
 	}
