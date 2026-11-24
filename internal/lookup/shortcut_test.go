@@ -32,6 +32,10 @@ func TestShortcutIndex_Add(t *testing.T) {
 		text: testRuleTextNoShortcutsURL,
 	}, {
 		want: assert.True,
+		name: "exact_shortcut_length",
+		text: "||a.com^",
+	}, {
+		want: assert.True,
 		name: "success",
 		text: testRuleText,
 	}}
@@ -184,6 +188,17 @@ func TestShortcutIndex_AppendMatching(t *testing.T) {
 		decoded := lookup.NewShortcutIndex()
 		require.NoError(t, decoded.UnmarshalBinary(data))
 		assert.Equal(t, want, decoded.AppendMatching(nil, r))
+	})
+
+	t.Run("trailing_exact_length", func(t *testing.T) {
+		t.Parallel()
+
+		sExact := newStorage(t, "||a.com^")
+		idxExact := lookup.NewShortcutIndex()
+		loadIndex(t, idxExact, sExact)
+
+		r := rules.NewRequestForHostname("a.com")
+		assertMatch(t, idxExact, r, filterlist.NewStorageID(1, 0))
 	})
 }
 
