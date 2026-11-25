@@ -236,16 +236,37 @@ func TestFindRegexShortcut(t *testing.T) {
 		wantShortcut: "example",
 	}, {
 		input:        "/^http:\\/\\/example/",
-		wantShortcut: "/example",
+		wantShortcut: "http://example",
 	}, {
 		input:        "/^http:\\/\\/[a-z]+\\.example/",
-		wantShortcut: "example",
+		wantShortcut: ".example",
 	}, {
 		input:        "//",
 		wantShortcut: "",
 	}, {
 		input:        "/^http:\\/\\/(?!test.)example.org/",
 		wantShortcut: "",
+	}, {
+		input:        "/^139\\.45\\.197\\.2(4[0-9]|5[0-4]):/",
+		wantShortcut: "139.45.197.2",
+	}, {
+		input:        "/(https?:\\/\\/)213\\.32\\.115\\..{100,}/",
+		wantShortcut: "://213.32.115.",
+	}, {
+		input:        "/^(mon|tue|wed)\\d+\\.com$/",
+		wantShortcut: ".com",
+	}, {
+		input:        "/foo(barbaz)?qux/",
+		wantShortcut: "foo",
+	}, {
+		input:        "/(abcde){2,3}/",
+		wantShortcut: "abcde",
+	}, {
+		input:        "/(abcde){0,3}/",
+		wantShortcut: "",
+	}, {
+		input:        "/café\\.example\\.com/",
+		wantShortcut: ".example.com",
 	}}
 
 	for _, tc := range testCases {

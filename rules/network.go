@@ -5,9 +5,11 @@ import (
 	"math/bits"
 	"net/netip"
 	"regexp"
+	"regexp/syntax"
 	"slices"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/AdguardTeam/golibs/container"
 	"github.com/AdguardTeam/golibs/mathutil"
@@ -28,14 +30,7 @@ const (
 )
 
 // Common regular expressions.
-var (
-	regexpBracketsCurly           = regexp.MustCompile(`([^\\])\{.*[^\\]\}`)
-	regexpBracketsRound           = regexp.MustCompile(`([^\\])\(.*[^\\]\)`)
-	regexpBracketsSquare          = regexp.MustCompile(`([^\\])\[.*[^\\]\]`)
-	regexpEscapedCharacters       = regexp.MustCompile(`([^\\])\[a-zA-Z]`)
-	regexpEscapedOptionsDelimiter = regexp.MustCompile(regexp.QuoteMeta("\\$"))
-	regexpSpecialCharacters       = regexp.MustCompile(`[\\^$*+?.()|[\]{}]`)
-)
+var regexpEscapedOptionsDelimiter = regexp.MustCompile(regexp.QuoteMeta("\\$"))
 
 // minPatternLen is the minimum valid pattern length for network rule.
 const minPatternLen = 4
@@ -1280,48 +1275,73 @@ func findShortcut(pattern string) (shortcut string) {
 	return shortcut
 }
 
-// findRegexpShortcut searches for a shortcut inside of a regexp pattern.  A
-// shortcut in this case is a longest string with no regexp special characters.
-// It also discards complicated regexps right away.
-//
-// TODO(a.garipov):  This requires a deep refactoring and optimization.
+// findRegexpShortcut extracts the longest mandatory pure-ASCII literal run from
+// a regexp pattern ("/...") using [regexp/syntax.Parse].  Only literals
+// guaranteed to appear in every match are considered.  Invalid regexps return
+// an empty string.
 func findRegexpShortcut(pattern string) (shortcut string) {
-	// Strip backslashes.
-	pattern = pattern[1 : len(pattern)-1]
-
-	if strings.Contains(pattern, "?") {
-		// Do not mess with complex expressions which use lookahead.
-		//
-		// See https://github.com/AdguardTeam/AdguardBrowserExtension/issues/978.
-		//
-		// TODO(a.garipov):  Reinspect.
+	if len(pattern) < 2 {
 		return ""
 	}
 
-	// placeholder for a special character
-	specialCharacter := "..."
+	re, err := syntax.Parse(pattern[1:len(pattern)-1], syntax.Perl)
+	if err != nil {
+		return ""
+	}
 
-	// (Dirty) prepend specialCharacter for the following replace calls to work properly
-	pattern = specialCharacter + pattern
+	var cur []byte
+	var best string
+	flush := func() {
+		if len(cur) > len(best) {
+			best = string(cur)
+		}
+		cur = cur[:0]
+	}
 
-	// Strip all types of brackets.
-	pattern = regexpBracketsCurly.ReplaceAllString(pattern, "$1"+specialCharacter)
-	pattern = regexpBracketsRound.ReplaceAllString(pattern, "$1"+specialCharacter)
-	pattern = regexpBracketsSquare.ReplaceAllString(pattern, "$1"+specialCharacter)
-
-	// Strip some escaped characters.
-	pattern = regexpEscapedCharacters.ReplaceAllString(pattern, "$1"+specialCharacter)
-
-	// Split by special characters.
-	parts := regexpSpecialCharacters.Split(pattern, -1)
-	longest := ""
-	for _, part := range parts {
-		if len(part) > len(longest) {
-			longest = part
+	var walk func(node *syntax.Regexp)
+	walk = func(node *syntax.Regexp) {
+		switch node.Op {
+		case syntax.OpLiteral:
+			for _, r := range node.Rune {
+				if r < utf8.RuneSelf {
+					cur = append(cur, byte(r))
+				} else {
+					flush()
+				}
+			}
+		case syntax.OpConcat:
+			for _, sub := range node.Sub {
+				walk(sub)
+			}
+		case syntax.OpCapture:
+			if len(node.Sub) == 1 {
+				walk(node.Sub[0])
+			} else {
+				flush()
+			}
+		case syntax.OpPlus:
+			flush()
+			if len(node.Sub) == 1 {
+				walk(node.Sub[0])
+			}
+			flush()
+		case syntax.OpRepeat:
+			flush()
+			if node.Min >= 1 && len(node.Sub) == 1 {
+				walk(node.Sub[0])
+			}
+			flush()
+		default:
+			// OpAlternate, OpQuest, OpStar, OpRepeat(Min==0), char classes,
+			// assertions, etc.: never descend into optional/alternating nodes.
+			flush()
 		}
 	}
 
-	return longest
+	walk(re)
+	flush()
+
+	return best
 }
 
 // parseRuleText splits the rule's text into pattern, which is a basic rule
