@@ -72,6 +72,18 @@ const (
 	listIdxMask  = (uint64(1) << listIdxBits) - 1
 	maxRuleIdx   = int64(ruleIdxMask)
 	maxListCount = 1 << listIdxBits
+
+	// L1-resident 1 KB (8192-bit) 2-hash Bloom filter to reject non-matching
+	// 5-byte sliding windows before probing idx.shortcuts.  Bypassed when
+	// len(shortcuts) exceeds shortcutBloomMaxKeys to avoid overhead once
+	// saturated on very large NetworkEngine tables.
+	shortcutBloomLog2    = 13
+	shortcutBloomBits    = 1 << shortcutBloomLog2
+	shortcutBloomWords   = shortcutBloomBits / 64
+	shortcutBloomMaxKeys = shortcutBloomBits / 2
+	shortcutHashMul1     = uint64(0x9e3779b97f4a7c15)
+	shortcutHashMul2     = uint64(0xbf58476d1ce4e5b9)
+	shortcutMask         = (uint64(1) << (shortcutLength * 8)) - 1
 )
 
 // shortcutNode is a 12-byte, pointer-free linked-list node stored in
@@ -113,6 +125,27 @@ type ShortcutIndex struct {
 	// listIDs maps compact 16-bit list indexes back to full [rules.ListID]
 	// values.
 	listIDs []rules.ListID
+
+	// bloom is a 1 KB 2-hash Bloom filter over all keys in shortcuts.
+	bloom [shortcutBloomWords]uint64
+}
+
+func (idx *ShortcutIndex) bloomAdd(sc shortcut) {
+	h1 := (uint64(sc) * shortcutHashMul1) >> (64 - shortcutBloomLog2)
+	h2 := (uint64(sc) * shortcutHashMul2) >> (64 - shortcutBloomLog2)
+	idx.bloom[h1>>6] |= 1 << (h1 & 63)
+	idx.bloom[h2>>6] |= 1 << (h2 & 63)
+}
+
+func (idx *ShortcutIndex) bloomMayContain(sc shortcut) (ok bool) {
+	h1 := (uint64(sc) * shortcutHashMul1) >> (64 - shortcutBloomLog2)
+	if idx.bloom[h1>>6]&(1<<(h1&63)) == 0 {
+		return false
+	}
+
+	h2 := (uint64(sc) * shortcutHashMul2) >> (64 - shortcutBloomLog2)
+
+	return idx.bloom[h2>>6]&(1<<(h2&63)) != 0
 }
 
 // shortcutsInARuleEst is the estimate for the number of shortcuts in a rule
@@ -169,6 +202,7 @@ func bucketLen(v uint64) (n uint64) {
 
 // insertPacked inserts packed into the bucket for sc.
 func (idx *ShortcutIndex) insertPacked(sc shortcut, packed uint64) {
+	idx.bloomAdd(sc)
 	v, ok := idx.shortcuts[sc]
 	if !ok {
 		idx.shortcuts[sc] = packed
@@ -365,6 +399,9 @@ func (idx *ShortcutIndex) AppendMatching(
 	r *rules.Request,
 ) (res []filterlist.StorageID) {
 	res = orig
+	if len(idx.shortcuts) == 0 {
+		return res
+	}
 
 	s := r.URLLowerCase
 	l := len(s)
@@ -372,8 +409,15 @@ func (idx *ShortcutIndex) AppendMatching(
 		return res
 	}
 
-	for i := range l - shortcutLength + 1 {
-		v, ok := idx.shortcuts[packShortcut(s, i)]
+	useBloom := len(idx.shortcuts) <= shortcutBloomMaxKeys
+	sc := uint64(s[0])<<24 | uint64(s[1])<<16 | uint64(s[2])<<8 | uint64(s[3])
+	for i := shortcutLength - 1; i < l; i++ {
+		sc = ((sc << 8) | uint64(s[i])) & shortcutMask
+		if useBloom && !idx.bloomMayContain(shortcut(sc)) {
+			continue
+		}
+
+		v, ok := idx.shortcuts[shortcut(sc)]
 		if !ok {
 			continue
 		}
@@ -401,6 +445,7 @@ func (idx *ShortcutIndex) AppendMatching(
 // Reset prepares idx for reuse.
 func (idx *ShortcutIndex) Reset() {
 	clear(idx.shortcuts)
+	clear(idx.bloom[:])
 	idx.nodes = idx.nodes[:0]
 	idx.listIDs = idx.listIDs[:0]
 }
@@ -433,6 +478,7 @@ func (idx *ShortcutIndex) UnmarshalBinaryRest(b []byte) (rest []byte, err error)
 	var keyBuffer []byte
 	var idsBuf []uint64
 	idx.shortcuts = make(map[shortcut]uint64, l)
+	clear(idx.bloom[:])
 	idx.nodes = idx.nodes[:0]
 	idx.listIDs = idx.listIDs[:0]
 
@@ -474,6 +520,7 @@ func (idx *ShortcutIndex) UnmarshalBinaryRest(b []byte) (rest []byte, err error)
 			}
 
 			idx.shortcuts[sc] = packed
+			idx.bloomAdd(sc)
 
 			continue
 		}
