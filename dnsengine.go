@@ -144,7 +144,14 @@ func (e *DNSEngine) getRequestFromPool(dReq *DNSRequest) (req *rules.Request) {
 	req.DNSType = dReq.DNSType
 	req.IsAnswer = dReq.Answer
 
-	rules.FillRequestForHostname(req, dReq.Hostname)
+	urlStr := "http://" + dReq.Hostname
+	req.URL = urlStr
+	req.URLLowerCase = urlStr
+	req.Hostname = dReq.Hostname
+	req.Domain = ""
+	req.RequestType = rules.TypeDocument
+	req.ThirdParty = false
+	req.IsHostnameRequest = true
 
 	return req
 }
