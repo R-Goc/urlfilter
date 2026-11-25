@@ -206,6 +206,42 @@ func (idx *SimpleDomainIndex) AppendMatching(
 	return res
 }
 
+// AppendExactMatching appends candidate [filterlist.StorageID] values matching
+// hostname exactly (without walking parent domains) to orig.
+func (idx *SimpleDomainIndex) AppendExactMatching(
+	orig []filterlist.StorageID,
+	hostname string,
+) (res []filterlist.StorageID) {
+	res = orig
+	n := uint64(len(idx.tags))
+	if n == 0 || hostname == "" {
+		return res
+	}
+
+	hv := hashDomainString(hostname)
+	tag := hashTag(hv)
+	// #nosec G115 -- Lower 32 bits of the 64-bit hash.
+	pos := lemireRange(uint32(hv), n)
+	tags := idx.tags
+	for {
+		t := tags[pos]
+		if t == 0 {
+			break
+		}
+
+		if t == tag {
+			res = append(res, idx.storageIDAt(pos))
+		}
+
+		pos++
+		if pos == n {
+			pos = 0
+		}
+	}
+
+	return res
+}
+
 func (idx *SimpleDomainIndex) storageIDAt(pos uint64) (id filterlist.StorageID) {
 	if idx.slotListIdx == nil {
 		packed := idx.ruleIdx[pos]

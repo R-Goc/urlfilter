@@ -1,6 +1,8 @@
 package urlfilter
 
 import (
+	"bytes"
+
 	"github.com/AdguardTeam/golibs/container"
 	"github.com/AdguardTeam/golibs/syncutil"
 	"github.com/AdguardTeam/urlfilter/filterlist"
@@ -13,8 +15,13 @@ import (
 // First, it looks over network rules and returns first rule found.
 // Then, if nothing found, it looks up the host rules.
 type DNSEngine struct {
-	// ruleIndex is a map for hosts mapped to the list of rule indexes.
+	// ruleIndex is a fallback map for host rules not stored in hostDomains
+	// (e.g. lines with inline comments or exceeding index limits).
 	ruleIndex map[string][]filterlist.StorageID
+
+	// hostDomains indexes exact-match host rules ("example.com",
+	// "0.0.0.0 example.com") in a compact pointer-free hash table.
+	hostDomains *lookup.SimpleDomainIndex
 
 	// simpleDomains indexes pure domain rules ("||domain^", "@@||domain^") in a
 	// compact pointer-free hash table.
@@ -51,14 +58,16 @@ func NewDNSEngine(s *filterlist.RuleStorage) (e *DNSEngine) {
 		rulesPool:     syncutil.NewSlicePool[*rules.HostRule](1),
 	}
 
-	// Pass 1: count simple domain rules without allocating so SimpleDomainIndex
-	// can be allocated once at its exact final size.
-	if simpleCount := s.NewRuleStorageScanner().CountSimpleDomains(); simpleCount > 0 {
-		e.simpleDomains = lookup.NewSimpleDomainIndex(
-			simpleCount,
-			s.ListCount(),
-			s.MaxListSizeEstimate(),
-		)
+	// Pass 1: count simple domain rules and host rule hostnames without
+	// allocating so both indexes are allocated once at their exact final size.
+	simpleCount, hostCount := s.NewRuleStorageScanner().CountFastDomains()
+	listCount := s.ListCount()
+	maxListSize := s.MaxListSizeEstimate()
+	if simpleCount > 0 {
+		e.simpleDomains = lookup.NewSimpleDomainIndex(simpleCount, listCount, maxListSize)
+	}
+	if hostCount > 0 {
+		e.hostDomains = lookup.NewSimpleDomainIndex(hostCount, listCount, maxListSize)
 	}
 
 	netEng := NewNetworkEngineSkipStorageScan(s)
@@ -66,7 +75,7 @@ func NewDNSEngine(s *filterlist.RuleStorage) (e *DNSEngine) {
 
 	scanner := s.NewRuleStorageScanner()
 	for {
-		dom, f, listID, ruleIdx, ok := scanner.ScanFast()
+		dom, hostLine, f, listID, ruleIdx, ok := scanner.ScanFast()
 		if !ok {
 			break
 		}
@@ -85,6 +94,10 @@ func NewDNSEngine(s *filterlist.RuleStorage) (e *DNSEngine) {
 			if err != nil || f == nil {
 				continue
 			}
+		} else if hostLine != nil {
+			e.addHostLine(hostLine, listID, ruleIdx)
+
+			continue
 		}
 
 		id := filterlist.NewStorageID(listID, ruleIdx)
@@ -190,7 +203,7 @@ func (e *DNSEngine) MatchRequestInto(req *DNSRequest, res *DNSResult) (matched b
 		e.simpleIDsPool.Put(idsPtr)
 	}
 
-	if len(e.ruleIndex) == 0 {
+	if e.hostDomains == nil && len(e.ruleIndex) == 0 {
 		return false
 	}
 
@@ -229,12 +242,57 @@ func (e *DNSEngine) appendFromIndex(
 ) (res []*rules.HostRule) {
 	res = matching
 
-	ids := e.ruleIndex[hostname]
-	for _, id := range ids {
-		res = append(res, e.rulesStorage.RetrieveHostRule(id))
+	if e.hostDomains != nil {
+		idsPtr := e.simpleIDsPool.Get()
+		defer e.simpleIDsPool.Put(idsPtr)
+
+		*idsPtr = e.hostDomains.AppendExactMatching((*idsPtr)[:0], hostname)
+		for _, id := range *idsPtr {
+			hr := e.rulesStorage.RetrieveHostRule(id)
+			if hr != nil && hr.Match(hostname) {
+				res = append(res, hr)
+			}
+		}
+	}
+
+	if len(e.ruleIndex) > 0 {
+		for _, id := range e.ruleIndex[hostname] {
+			if hr := e.rulesStorage.RetrieveHostRule(id); hr != nil {
+				res = append(res, hr)
+			}
+		}
 	}
 
 	return res
+}
+
+// addHostLine indexes all whitespace-separated hostnames from a fast-path host
+// rule line into hostDomains, falling back to ruleIndex per hostname if needed.
+func (e *DNSEngine) addHostLine(hostLine []byte, listID rules.ListID, ruleIdx int64) {
+	id := filterlist.NewStorageID(listID, ruleIdx)
+	for len(hostLine) > 0 {
+		sep := bytes.IndexAny(hostLine, " \t")
+		var tok []byte
+		if sep < 0 {
+			tok = hostLine
+			hostLine = nil
+		} else {
+			tok = hostLine[:sep]
+			hostLine = bytes.TrimLeft(hostLine[sep+1:], " \t")
+		}
+
+		if e.hostDomains != nil && e.hostDomains.AddBytes(tok, listID, ruleIdx) {
+			continue
+		}
+
+		if e.ruleIndex == nil {
+			e.ruleIndex = map[string][]filterlist.StorageID{}
+		}
+		key := string(tok)
+		e.ruleIndex[key] = append(e.ruleIndex[key], id)
+	}
+
+	e.rulesCount++
 }
 
 // addRule adds rule to the index.

@@ -65,6 +65,31 @@ func TestSimpleDomainIndex_AppendMatching(t *testing.T) {
 	assert.Empty(t, got)
 }
 
+func TestSimpleDomainIndex_AppendExactMatching(t *testing.T) {
+	t.Parallel()
+
+	idx := lookup.NewSimpleDomainIndex(16, 2, 1*datasize.MB)
+	require.True(t, idx.AddBytes([]byte("example.org"), uftest.ListID1, 10))
+	require.True(t, idx.AddBytes([]byte("example.org"), uftest.ListID2, 20))
+	require.True(t, idx.AddBytes([]byte("sub.example.org"), uftest.ListID1, 30))
+
+	// Exact match returns both rules in insertion order.
+	got := idx.AppendExactMatching(nil, "example.org")
+	assert.Equal(t, []filterlist.StorageID{
+		filterlist.NewStorageID(uftest.ListID1, 10),
+		filterlist.NewStorageID(uftest.ListID2, 20),
+	}, got)
+
+	// Subdomain does not match parent rule.
+	got = idx.AppendExactMatching(nil, "a.sub.example.org")
+	assert.Empty(t, got)
+
+	got = idx.AppendExactMatching(nil, "sub.example.org")
+	assert.Equal(t, []filterlist.StorageID{
+		filterlist.NewStorageID(uftest.ListID1, 30),
+	}, got)
+}
+
 func TestSimpleDomainIndex_bulk(t *testing.T) {
 	t.Parallel()
 

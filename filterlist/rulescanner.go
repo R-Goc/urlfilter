@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"io"
+	"net/netip"
 
+	"github.com/AdguardTeam/urlfilter/internal/ufnet"
 	"github.com/AdguardTeam/urlfilter/rules"
 )
 
@@ -66,17 +68,18 @@ func (s *RuleScanner) Rule() (r rules.Rule, idx int64) {
 	return s.currentRule, s.currentRuleIndex
 }
 
-// CountSimpleDomains scans s to EOF and returns the number of pure simple
-// domain rules ("||domain^" / "@@||domain^") without allocating rules.
-func (s *RuleScanner) CountSimpleDomains() (n int) {
+// CountFastDomains scans s to EOF and returns the number of pure simple domain
+// rules ("||domain^" / "@@||domain^") and fast-path host rule hostnames without
+// allocating rules.
+func (s *RuleScanner) CountFastDomains() (simpleCount, hostCount int) {
 	for {
 		chunk, _, err := s.readNextLineBytes()
 		if err != nil {
-			return n
+			return simpleCount, hostCount
 		}
 
 		trimmed := bytes.TrimSpace(chunk)
-		if len(trimmed) == 0 || trimmed[0] == '!' {
+		if len(trimmed) == 0 || trimmed[0] == '!' || trimmed[0] == '#' {
 			continue
 		}
 
@@ -93,17 +96,25 @@ func (s *RuleScanner) CountSimpleDomains() (n int) {
 		}
 
 		if _, ok := parseSimpleDomainRuleBytes(trimmed); ok {
-			n++
+			simpleCount++
+
+			continue
+		}
+
+		if hosts, ok := parseHostRuleBytes(trimmed); ok {
+			hostCount += countHostTokens(hosts)
 		}
 	}
 }
 
 // ScanFast advances s to the next rule, returning either a zero-allocation
-// simple pure-domain slice (for "||domain^" or "@@||domain^" lines) or a parsed
-// [rules.Rule].  The returned simpleDomain slice is only valid until the next
+// simple pure-domain slice (for "||domain^" or "@@||domain^" lines), a
+// zero-allocation hostnames slice (for bare-domain or "IP host..." lines), or a
+// parsed [rules.Rule].  The returned byte slices are only valid until the next
 // scan call.
 func (s *RuleScanner) ScanFast() (
 	simpleDomain []byte,
+	hostLine []byte,
 	rule rules.Rule,
 	listID rules.ListID,
 	idx int64,
@@ -112,7 +123,7 @@ func (s *RuleScanner) ScanFast() (
 	for {
 		chunk, lineIdx, err := s.readNextLineBytes()
 		if err != nil {
-			return nil, nil, 0, 0, false
+			return nil, nil, nil, 0, 0, false
 		}
 
 		trimmed := bytes.TrimSpace(chunk)
@@ -133,14 +144,70 @@ func (s *RuleScanner) ScanFast() (
 		}
 
 		if dom, isSimple := parseSimpleDomainRuleBytes(trimmed); isSimple {
-			return dom, nil, s.listID, lineIdx, true
+			return dom, nil, nil, s.listID, lineIdx, true
+		}
+
+		if hosts, isHost := parseHostRuleBytes(trimmed); isHost {
+			return nil, hosts, nil, s.listID, lineIdx, true
 		}
 
 		r, parseErr := rules.NewRule(string(trimmed), s.listID)
 		if r != nil && parseErr == nil && !s.isIgnored(r) {
-			return nil, r, s.listID, lineIdx, true
+			return nil, nil, r, s.listID, lineIdx, true
 		}
 	}
+}
+
+// parseHostRuleBytes checks whether line is a fast-path host rule (either a
+// bare domain or "IP host1 [host2 ...]" with no '#' or '$' characters) and
+// returns the whitespace-separated hostname tokens without allocating.
+func parseHostRuleBytes(line []byte) (hosts []byte, ok bool) {
+	if bytes.IndexByte(line, '#') >= 0 || bytes.IndexByte(line, '$') >= 0 {
+		return nil, false
+	}
+
+	sep := bytes.IndexAny(line, " \t")
+	if sep < 0 {
+		if ufnet.IsDomainNameBytes(line) {
+			return line, true
+		}
+
+		return nil, false
+	}
+
+	c0 := line[0]
+	isIPStart := (c0 >= '0' && c0 <= '9') ||
+		(c0 >= 'a' && c0 <= 'f') ||
+		(c0 >= 'A' && c0 <= 'F') ||
+		c0 == ':'
+	if !isIPStart {
+		return nil, false
+	}
+
+	if _, err := netip.ParseAddr(string(line[:sep])); err != nil {
+		return nil, false
+	}
+
+	rest := bytes.TrimLeft(line[sep+1:], " \t")
+	if len(rest) == 0 {
+		return nil, false
+	}
+
+	return rest, true
+}
+
+func countHostTokens(hosts []byte) (n int) {
+	for len(hosts) > 0 {
+		sep := bytes.IndexAny(hosts, " \t")
+		n++
+		if sep < 0 {
+			break
+		}
+
+		hosts = bytes.TrimLeft(hosts[sep+1:], " \t")
+	}
+
+	return n
 }
 
 // readNextLineBytes reads the next line using ReadSlice to avoid allocating a

@@ -87,30 +87,43 @@ func TestRuleScanner_ScanFast(t *testing.T) {
 		"# hash comment",
 		"  ||simple.example^  ",
 		"@@||allow.example^",
+		"bare.example.org",
+		"0.0.0.0 host1.example host2.example",
+		"0.0.0.0 inline.example # comment",
 		"||unsupported.example^$all",
 		"example.org##.ad",
 		"||modifier.example^$important",
 	}, "\n")
 
+	countScanner := filterlist.NewRuleScanner(strings.NewReader(content), uftest.ListID1, true)
+	simpleCount, hostCount := countScanner.CountFastDomains()
+	assert.Equal(t, 2, simpleCount)
+	assert.Equal(t, 3, hostCount)
+
 	s := filterlist.NewRuleScanner(strings.NewReader(content), uftest.ListID1, true)
 
 	var simpleDomains []string
+	var hostLines []string
 	var parsedRules []string
 	for {
-		dom, r, listID, _, ok := s.ScanFast()
+		dom, hostLine, r, listID, _, ok := s.ScanFast()
 		if !ok {
 			break
 		}
 		assert.Equal(t, uftest.ListID1, listID)
-		if dom != nil {
+		switch {
+		case dom != nil:
 			simpleDomains = append(simpleDomains, string(dom))
-		} else {
+		case hostLine != nil:
+			hostLines = append(hostLines, string(hostLine))
+		default:
 			parsedRules = append(parsedRules, r.Text())
 		}
 	}
 
 	assert.Equal(t, []string{"simple.example", "allow.example"}, simpleDomains)
-	assert.Equal(t, []string{"||modifier.example^$important"}, parsedRules)
+	assert.Equal(t, []string{"bare.example.org", "host1.example host2.example"}, hostLines)
+	assert.Equal(t, []string{"0.0.0.0 inline.example # comment", "||modifier.example^$important"}, parsedRules)
 }
 
 func BenchmarkRuleScanner_Scan(b *testing.B) {

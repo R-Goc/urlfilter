@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/AdguardTeam/golibs/container"
@@ -145,6 +146,92 @@ func TestMultipleIPPerHost(t *testing.T) {
 	res, ok := dnsEngine.Match("example.org")
 	require.True(t, ok)
 	require.Equal(t, 2, len(res.HostRulesV4))
+}
+
+func TestDNSEngine_hostRulesFastPath(t *testing.T) {
+	t.Parallel()
+
+	text := strings.Join([]string{
+		"# comment line",
+		"bare.example.org",
+		"0.0.0.0 multi1.example.org multi2.example.org",
+		"127.0.0.1 CaseSensitive.Test",
+		"0.0.0.0 commented.example.org # inline comment",
+		"||simple.example.org^",
+	}, "\n")
+
+	ruleStorage := newTestRuleStorage(t, uftest.ListID1, text)
+	dnsEngine := urlfilter.NewDNSEngine(ruleStorage)
+
+	assert.Equal(t, uint64(5), dnsEngine.RulesCount())
+
+	res, ok := dnsEngine.Match("bare.example.org")
+	require.True(t, ok)
+	require.Len(t, res.HostRulesV4, 1)
+	assert.Equal(t, netip.IPv4Unspecified(), res.HostRulesV4[0].IP)
+
+	// Subdomain does not match exact host rule.
+	_, ok = dnsEngine.Match("sub.bare.example.org")
+	assert.False(t, ok)
+
+	for _, host := range []string{"multi1.example.org", "multi2.example.org"} {
+		res, ok = dnsEngine.Match(host)
+		require.True(t, ok)
+		require.Len(t, res.HostRulesV4, 1)
+	}
+
+	// Host rules remain case-sensitive.
+	_, ok = dnsEngine.Match("CaseSensitive.Test")
+	assert.True(t, ok)
+	_, ok = dnsEngine.Match("casesensitive.test")
+	assert.False(t, ok)
+
+	// Inline-commented host line still matches via fallback ruleIndex.
+	res, ok = dnsEngine.Match("commented.example.org")
+	require.True(t, ok)
+	require.Len(t, res.HostRulesV4, 1)
+}
+
+func TestDNSEngine_concurrentMatch(t *testing.T) {
+	t.Parallel()
+
+	text := strings.Join([]string{
+		"||blocked.example.org^",
+		"@@||allowed.blocked.example.org^",
+		"bare-host.example.org",
+		"0.0.0.0 ip-host.example.org",
+		"/^139\\.45\\.197\\.2(4[0-9]|5[0-4]):/",
+	}, "\n")
+
+	ruleStorage := newTestRuleStorage(t, uftest.ListID1, text)
+	dnsEngine := urlfilter.NewDNSEngine(ruleStorage)
+
+	domains := []string{
+		"blocked.example.org",
+		"sub.blocked.example.org",
+		"allowed.blocked.example.org",
+		"bare-host.example.org",
+		"ip-host.example.org",
+		"unmatched.example.net",
+	}
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req := &urlfilter.DNSRequest{}
+			res := &urlfilter.DNSResult{}
+			for range 200 {
+				for _, d := range domains {
+					req.Hostname = d
+					res.Reset()
+					_ = dnsEngine.MatchRequestInto(req, res)
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 func TestClientTags(t *testing.T) {

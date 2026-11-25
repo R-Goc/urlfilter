@@ -2,6 +2,7 @@
 package ufnet
 
 import (
+	"bytes"
 	"strings"
 
 	"github.com/AdguardTeam/golibs/netutil"
@@ -76,6 +77,59 @@ func IsDomainName(name string) (ok bool) {
 	}
 
 	return isValidTLDLabel(label)
+}
+
+// IsDomainNameBytes is like [IsDomainName] but operates on a byte slice without
+// allocating.
+func IsDomainNameBytes(name []byte) (ok bool) {
+	if len(name) > netutil.MaxDomainNameLen {
+		return false
+	}
+
+	label, tail, found := bytes.Cut(name, []byte{'.'})
+	for ; found; label, tail, found = bytes.Cut(tail, []byte{'.'}) {
+		if !isValidLabelBytes(label) {
+			return false
+		}
+	}
+
+	return isValidTLDLabelBytes(label)
+}
+
+func isValidLabelBytes(label []byte) (ok bool) {
+	l := len(label)
+	if l == 0 || l > netutil.MaxDomainLabelLen {
+		return false
+	}
+
+	if bytes.HasPrefix(label, []byte(xnPrefix)) && l < minXNLabelLen {
+		return false
+	}
+
+	for i, c := range label {
+		if isLetter(c) || isDigit(c) {
+			continue
+		}
+
+		if c != '-' || i == 0 || i == l-1 {
+			return false
+		}
+	}
+
+	return true
+}
+
+func isValidTLDLabelBytes(label []byte) (ok bool) {
+	if !isValidLabelBytes(label) {
+		return false
+	}
+
+	l := len(label)
+	if l < 2 {
+		return false
+	}
+
+	return isLetter(label[0]) && isLetter(label[l-1])
 }
 
 const (

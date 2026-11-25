@@ -264,6 +264,18 @@ func TestIsDomainName(t *testing.T) {
 	}
 }
 
+func TestIsDomainNameBytes(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range domainNameTestCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			tc.want(t, ufnet.IsDomainNameBytes([]byte(tc.in)))
+		})
+	}
+}
+
 func FuzzIsDomainName(f *testing.F) {
 	f.Skip("Skip because current implementation is performance oriented")
 
