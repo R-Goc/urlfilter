@@ -138,10 +138,10 @@ func (o NetworkRuleOption) Count() (n int) {
 	return bits.OnesCount64(uint64(o))
 }
 
-// NetworkRule is a basic filtering rule.
-//
-// See https://adguard.com/kb/general/ad-filtering/create-own-filters/#basic-rules.
-type NetworkRule struct {
+// networkRuleModifiers holds optional modifier fields for [NetworkRule] so
+// rules without domain, client, ctag, dnstype, or respgeo modifiers do not pay
+// for those 13 fields in memory or GC scanning.
+type networkRuleModifiers struct {
 	// permittedClients are permitted clients from the $client modifier.
 	//
 	// See https://github.com/AdguardTeam/AdGuardHome/issues/1761.
@@ -151,12 +151,6 @@ type NetworkRule struct {
 	//
 	// See https://github.com/AdguardTeam/AdGuardHome/issues/1761.
 	restrictedClients *clients
-
-	// DNSRewrite is the DNS rewrite rule, if any.
-	DNSRewrite *DNSRewrite
-
-	// regexp is the regular expression compiled from the pattern.
-	regexp *regexp.Regexp
 
 	// permittedClientTags is a sorted list of permitted client tags from the
 	// $ctag modifier.
@@ -169,9 +163,6 @@ type NetworkRule struct {
 	//
 	// See https://github.com/AdguardTeam/AdGuardHome/issues/1081#issuecomment-575142737.
 	restrictedClientTags *container.SortedSliceSet[string]
-
-	// text is the original rule text.
-	text string
 
 	// permittedASNs is a sorted list of permitted ASNs from the $respgeo
 	// modifier.
@@ -188,13 +179,6 @@ type NetworkRule struct {
 	// restrictedCountries is a sorted list of restricted countries from the
 	// $respgeo modifier.  It must contain only lowercase values.
 	restrictedCountries *container.SortedSliceSet[geoip.Country]
-
-	// Shortcut is the longest substring of the rule pattern with no special
-	// characters.
-	Shortcut string
-
-	// pattern is the basic rule pattern ready to be compiled to regex.
-	pattern string
 
 	// permittedDomains is a list of permitted domains from the $domain
 	// modifier.
@@ -215,6 +199,58 @@ type NetworkRule struct {
 	// restrictedDNSTypes is the list of restricted DNS record type names from
 	// the $dnstype modifier.
 	restrictedDNSTypes []RRType
+}
+
+// equal reports whether m and other have identical badfilter-relevant modifier
+// restrictions (domains, client tags, clients, and GeoIP).
+func (m *networkRuleModifiers) equal(other *networkRuleModifiers) (ok bool) {
+	if m == other {
+		return true
+	}
+
+	var a, b networkRuleModifiers
+	if m != nil {
+		a = *m
+	}
+	if other != nil {
+		b = *other
+	}
+
+	return slices.Equal(a.permittedDomains, b.permittedDomains) &&
+		slices.Equal(a.restrictedDomains, b.restrictedDomains) &&
+		a.permittedClientTags.Equal(b.permittedClientTags) &&
+		a.restrictedClientTags.Equal(b.restrictedClientTags) &&
+		a.permittedClients.equal(b.permittedClients) &&
+		a.restrictedClients.equal(b.restrictedClients) &&
+		a.permittedASNs.Equal(b.permittedASNs) &&
+		a.restrictedASNs.Equal(b.restrictedASNs) &&
+		a.permittedCountries.Equal(b.permittedCountries) &&
+		a.restrictedCountries.Equal(b.restrictedCountries)
+}
+
+// NetworkRule is a basic filtering rule.
+//
+// See https://adguard.com/kb/general/ad-filtering/create-own-filters/#basic-rules.
+type NetworkRule struct {
+	// DNSRewrite is the DNS rewrite rule, if any.
+	DNSRewrite *DNSRewrite
+
+	// regexp is the regular expression compiled from the pattern.
+	regexp *regexp.Regexp
+
+	// modifiers holds optional modifier restrictions; nil on rules without
+	// $domain, $denyallow, $dnstype, $ctag, $client, or $respgeo.
+	modifiers *networkRuleModifiers
+
+	// text is the original rule text.
+	text string
+
+	// Shortcut is the longest substring of the rule pattern with no special
+	// characters.
+	Shortcut string
+
+	// pattern is the basic rule pattern ready to be compiled to regex.
+	pattern string
 
 	// id is a filter list identifier.
 	id ListID
@@ -250,6 +286,15 @@ type NetworkRule struct {
 
 	// matchesNothing shows if the rule matches nothing.
 	matchesNothing bool
+}
+
+// ensureModifiers lazily allocates and returns r.modifiers.
+func (r *NetworkRule) ensureModifiers() (m *networkRuleModifiers) {
+	if r.modifiers == nil {
+		r.modifiers = &networkRuleModifiers{}
+	}
+
+	return r.modifiers
 }
 
 // NewNetworkRule parses the rule text and returns a filter rule.
@@ -309,25 +354,35 @@ func isPatternTooWide(pattern string) (ok bool) {
 //
 // TODO(f.setrakov): Invert the condition.
 func (r *NetworkRule) hasNoRestrictions() (ok bool) {
-	return len(r.permittedDomains) == 0 &&
-		len(r.restrictedDomains) == 0 &&
-		r.permittedClients.len() == 0 &&
-		r.restrictedClients.len() == 0 &&
-		r.permittedClientTags.Len() == 0 &&
-		r.restrictedClientTags.Len() == 0 &&
-		len(r.permittedDNSTypes) == 0 &&
-		len(r.restrictedDNSTypes) == 0 &&
-		len(r.denyAllowDomains) == 0 &&
+	m := r.modifiers
+	if m == nil {
+		return true
+	}
+
+	return len(m.permittedDomains) == 0 &&
+		len(m.restrictedDomains) == 0 &&
+		m.permittedClients.len() == 0 &&
+		m.restrictedClients.len() == 0 &&
+		m.permittedClientTags.Len() == 0 &&
+		m.restrictedClientTags.Len() == 0 &&
+		len(m.permittedDNSTypes) == 0 &&
+		len(m.restrictedDNSTypes) == 0 &&
+		len(m.denyAllowDomains) == 0 &&
 		!r.hasGeoIPRestrictions()
 }
 
 // hasGeoIPRestrictions returns true if the rule has ASN or Country
 // restrictions.
 func (r *NetworkRule) hasGeoIPRestrictions() (ok bool) {
-	return r.restrictedASNs.Len() > 0 ||
-		r.permittedASNs.Len() > 0 ||
-		r.restrictedCountries.Len() > 0 ||
-		r.permittedCountries.Len() > 0
+	m := r.modifiers
+	if m == nil {
+		return false
+	}
+
+	return m.restrictedASNs.Len() > 0 ||
+		m.permittedASNs.Len() > 0 ||
+		m.restrictedCountries.Len() > 0 ||
+		m.permittedCountries.Len() > 0
 }
 
 // type check
@@ -356,18 +411,24 @@ func (r *NetworkRule) Match(req *Request) (ok bool) {
 		!r.matchShortcut(req),
 		r.IsOptionEnabled(OptionThirdParty) && !req.ThirdParty,
 		r.IsOptionDisabled(OptionThirdParty) && req.ThirdParty,
-		!r.matchRequestType(req.RequestType),
-		!r.matchRequestDomain(req.Hostname, req.IsHostnameRequest),
-		!r.matchSourceDomain(req.SourceHostname),
-		!r.matchDNSType(req.DNSType),
-		!r.matchClientTags(req.ClientTags),
-		!r.matchClient(req.ClientIdentifiers, req.ClientIP),
-		!r.matchGeoIP(req.ResponseASN, req.ResponseCountry, req.IsAnswer),
-		!r.matchPattern(req):
+		!r.matchRequestType(req.RequestType):
 		return false
 	}
 
-	return true
+	if r.modifiers != nil {
+		switch {
+		case
+			!r.matchRequestDomain(req.Hostname, req.IsHostnameRequest),
+			!r.matchSourceDomain(req.SourceHostname),
+			!r.matchDNSType(req.DNSType),
+			!r.matchClientTags(req.ClientTags),
+			!r.matchClient(req.ClientIdentifiers, req.ClientIP),
+			!r.matchGeoIP(req.ResponseASN, req.ResponseCountry, req.IsAnswer):
+			return false
+		}
+	}
+
+	return r.matchPattern(req)
 }
 
 // IsOptionEnabled returns true if the specified option is enabled.
@@ -382,13 +443,17 @@ func (r *NetworkRule) IsOptionDisabled(option NetworkRuleOption) (ok bool) {
 
 // GetPermittedDomains returns the domains this rule is allowed on.
 func (r *NetworkRule) GetPermittedDomains() (domains []string) {
-	return r.permittedDomains
+	if r.modifiers == nil {
+		return nil
+	}
+
+	return r.modifiers.permittedDomains
 }
 
 // IsHostLevelNetworkRule checks if this rule can be used for hosts-level
 // blocking.
 func (r *NetworkRule) IsHostLevelNetworkRule() (ok bool) {
-	if len(r.permittedDomains) > 0 || len(r.restrictedDomains) > 0 {
+	if m := r.modifiers; m != nil && (len(m.permittedDomains) > 0 || len(m.restrictedDomains) > 0) {
 		return false
 	}
 
@@ -423,7 +488,7 @@ func (r *NetworkRule) IsRegexRule() (ok bool) {
 // not restricted to a set of domains.  Note that it might be forbidden on some
 // domains, though.
 func (r *NetworkRule) IsGeneric() (ok bool) {
-	return len(r.permittedDomains) == 0
+	return r.modifiers == nil || len(r.modifiers.permittedDomains) == 0
 }
 
 // IsHigherPriority checks if the rule has higher priority than the specified
@@ -499,22 +564,20 @@ func (r *NetworkRule) isHigherPrioritySpec(other *NetworkRule) (ok bool) {
 // calcRuleSpecs returns the number of the rule's dedicated specifiers.  The
 // number of the rule's specifiers is used to determine the rule's priority.
 func (r *NetworkRule) calcRuleSpecs() (prio int) {
-	return r.enabledOptions.Count() +
+	prio = r.enabledOptions.Count() +
 		r.disabledOptions.Count() +
 		r.permittedRequestTypes.Count() +
-		r.restrictedRequestTypes.Count() +
-		mathutil.BoolToNumber[int](len(r.permittedDomains) != 0 || len(r.restrictedDomains) != 0) +
-		mathutil.BoolToNumber[int](
-			len(r.permittedDNSTypes) != 0 || len(r.restrictedDNSTypes) != 0,
-		) +
-		mathutil.BoolToNumber[int](
-			r.permittedClientTags.Len() != 0 || r.restrictedClientTags.Len() != 0,
-		) +
-		mathutil.BoolToNumber[int](
-			r.permittedClients.len() != 0 || r.restrictedClients.len() != 0,
-		) +
-		mathutil.BoolToNumber[int](len(r.denyAllowDomains) != 0) +
-		mathutil.BoolToNumber[int](r.hasGeoIPRestrictions())
+		r.restrictedRequestTypes.Count()
+	if m := r.modifiers; m != nil {
+		prio += mathutil.BoolToNumber[int](len(m.permittedDomains) != 0 || len(m.restrictedDomains) != 0) +
+			mathutil.BoolToNumber[int](len(m.permittedDNSTypes) != 0 || len(m.restrictedDNSTypes) != 0) +
+			mathutil.BoolToNumber[int](m.permittedClientTags.Len() != 0 || m.restrictedClientTags.Len() != 0) +
+			mathutil.BoolToNumber[int](m.permittedClients.len() != 0 || m.restrictedClients.len() != 0) +
+			mathutil.BoolToNumber[int](len(m.denyAllowDomains) != 0) +
+			mathutil.BoolToNumber[int](r.hasGeoIPRestrictions())
+	}
+
+	return prio
 }
 
 // negatesBadfilter only makes sense when r has a `badfilter` modifier.  It
@@ -529,16 +592,7 @@ func (r *NetworkRule) negatesBadfilter(other *NetworkRule) (ok bool) {
 		r.restrictedRequestTypes != other.restrictedRequestTypes,
 		(r.enabledOptions ^ OptionBadfilter) != other.enabledOptions,
 		r.disabledOptions != other.disabledOptions,
-		!slices.Equal(r.permittedDomains, other.permittedDomains),
-		!slices.Equal(r.restrictedDomains, other.restrictedDomains),
-		!r.permittedClientTags.Equal(other.permittedClientTags),
-		!r.restrictedClientTags.Equal(other.restrictedClientTags),
-		!r.permittedClients.equal(other.permittedClients),
-		!r.restrictedClients.equal(other.restrictedClients),
-		!r.permittedASNs.Equal(other.permittedASNs),
-		!r.restrictedASNs.Equal(other.restrictedASNs),
-		!r.permittedCountries.Equal(other.permittedCountries),
-		!r.restrictedCountries.Equal(other.restrictedCountries):
+		!r.modifiers.equal(other.modifiers):
 		return false
 	}
 
@@ -755,7 +809,8 @@ func (r *NetworkRule) matchShortcut(req *Request) (ok bool) {
 //
 //	"*$script,domain=example.org,denyallow=essential1.com|essential2.com"
 func (r *NetworkRule) matchRequestDomain(domain string, hostnameRequest bool) (ok bool) {
-	if len(r.denyAllowDomains) == 0 {
+	m := r.modifiers
+	if m == nil || len(m.denyAllowDomains) == 0 {
 		return true
 	}
 
@@ -769,26 +824,27 @@ func (r *NetworkRule) matchRequestDomain(domain string, hostnameRequest bool) (o
 		return false
 	}
 
-	return !isDomainOrSubdomainOfAny(domain, r.denyAllowDomains)
+	return !isDomainOrSubdomainOfAny(domain, m.denyAllowDomains)
 }
 
 // matchSourceDomain checks if the specified filtering rule is allowed on this
 // domain.  That is, it checks the domain against what's specified in the
 // $domain modifier.
 func (r *NetworkRule) matchSourceDomain(domain string) (ok bool) {
-	if len(r.permittedDomains) == 0 && len(r.restrictedDomains) == 0 {
+	m := r.modifiers
+	if m == nil || (len(m.permittedDomains) == 0 && len(m.restrictedDomains) == 0) {
 		return true
 	}
 
-	if len(r.restrictedDomains) > 0 {
-		if isDomainOrSubdomainOfAny(domain, r.restrictedDomains) {
+	if len(m.restrictedDomains) > 0 {
+		if isDomainOrSubdomainOfAny(domain, m.restrictedDomains) {
 			// Domain or host is restricted, i.e. $domain=~example.org.
 			return false
 		}
 	}
 
-	if len(r.permittedDomains) > 0 {
-		if !isDomainOrSubdomainOfAny(domain, r.permittedDomains) {
+	if len(m.permittedDomains) > 0 {
+		if !isDomainOrSubdomainOfAny(domain, m.permittedDomains) {
 			// Domain is not among permitted, i.e. $domain=example.org and we're
 			// checking example.com.
 			return false
@@ -801,17 +857,18 @@ func (r *NetworkRule) matchSourceDomain(domain string) (ok bool) {
 // matchDNSType checks if the specified filtering rule is allowed for this DNS
 // request record type.
 func (r *NetworkRule) matchDNSType(rtype uint16) (allowed bool) {
-	if len(r.permittedDNSTypes) == 0 && len(r.restrictedDNSTypes) == 0 {
+	m := r.modifiers
+	if m == nil || (len(m.permittedDNSTypes) == 0 && len(m.restrictedDNSTypes) == 0) {
 		return true
 	}
 
-	if slices.Contains(r.restrictedDNSTypes, rtype) {
+	if slices.Contains(m.restrictedDNSTypes, rtype) {
 		return false
 	}
 
 	// TODO(f.setrakov): Add a helper to perform such checks.
-	if len(r.permittedDNSTypes) > 0 {
-		return slices.Contains(r.permittedDNSTypes, rtype)
+	if len(m.permittedDNSTypes) > 0 {
+		return slices.Contains(m.permittedDNSTypes, rtype)
 	}
 
 	return true
@@ -819,21 +876,22 @@ func (r *NetworkRule) matchDNSType(rtype uint16) (allowed bool) {
 
 // matchClientTags returns true if r matches one of tags.
 func (r *NetworkRule) matchClientTags(tags *container.SortedSliceSet[string]) (ok bool) {
-	if r.restrictedClientTags.Len() == 0 && r.permittedClientTags.Len() == 0 {
+	m := r.modifiers
+	if m == nil || (m.restrictedClientTags.Len() == 0 && m.permittedClientTags.Len() == 0) {
 		// the rule doesn't contain $ctag extension
 		return true
 	}
 
-	if r.restrictedClientTags.Intersects(tags) {
+	if m.restrictedClientTags.Intersects(tags) {
 		// matched by restricted client tag
 		return false
 	}
 
-	if r.permittedClientTags.Len() != 0 {
+	if m.permittedClientTags.Len() != 0 {
 		// If the rule is permitted for specific tags only,
 		// we should check whether our tag is among permitted or not
 		// and return the result the result immediately
-		return r.permittedClientTags.Intersects(tags)
+		return m.permittedClientTags.Intersects(tags)
 	}
 
 	return true
@@ -842,15 +900,20 @@ func (r *NetworkRule) matchClientTags(tags *container.SortedSliceSet[string]) (o
 // matchClient returns true if the rule is specified for client defined by
 // host or ip.
 func (r *NetworkRule) matchClient(ids *container.SortedSliceSet[string], ip netip.Addr) (ok bool) {
-	restLen := r.restrictedClients.len()
-	permLen := r.permittedClients.len()
+	m := r.modifiers
+	if m == nil {
+		return true
+	}
+
+	restLen := m.restrictedClients.len()
+	permLen := m.permittedClients.len()
 
 	if restLen == 0 && permLen == 0 {
 		// The rule has no $client modifier.
 		return true
 	}
 
-	if r.restrictedClients.match(ids, ip) {
+	if m.restrictedClients.match(ids, ip) {
 		// The client is in the restricted set.
 		return false
 	}
@@ -858,7 +921,7 @@ func (r *NetworkRule) matchClient(ids *container.SortedSliceSet[string], ip neti
 	if permLen != 0 {
 		// If the rule is permitted for specific client only, check whether the
 		// client is among permitted.
-		return r.permittedClients.match(ids, ip)
+		return m.permittedClients.match(ids, ip)
 	}
 
 	// If we got here, permitted list is empty and the client is not among
@@ -868,25 +931,30 @@ func (r *NetworkRule) matchClient(ids *container.SortedSliceSet[string], ip neti
 
 // matchGeoIP returns true if r matches geoip data.
 func (r *NetworkRule) matchGeoIP(asn geoip.ASN, country geoip.Country, isAnswer bool) (ok bool) {
+	m := r.modifiers
+	if m == nil {
+		return true
+	}
+
 	if !isAnswer {
 		return !r.hasGeoIPRestrictions()
 	}
 
-	if r.restrictedASNs.Has(asn) || countriesHasFold(r.restrictedCountries, country) {
+	if m.restrictedASNs.Has(asn) || countriesHasFold(m.restrictedCountries, country) {
 		return false
 	}
 
-	asnPermLen := r.permittedASNs.Len()
-	countryPermLen := r.permittedCountries.Len()
+	asnPermLen := m.permittedASNs.Len()
+	countryPermLen := m.permittedCountries.Len()
 	if asnPermLen == 0 && countryPermLen == 0 {
 		return true
 	} else if asnPermLen == 0 {
-		return countriesHasFold(r.permittedCountries, country)
+		return countriesHasFold(m.permittedCountries, country)
 	} else if countryPermLen == 0 {
-		return r.permittedASNs.Has(asn)
+		return m.permittedASNs.Has(asn)
 	}
 
-	return countriesHasFold(r.permittedCountries, country) || r.permittedASNs.Has(asn)
+	return countriesHasFold(m.permittedCountries, country) || m.permittedASNs.Has(asn)
 }
 
 // countriesHasFold returns true if the set contains the country, using
@@ -1113,11 +1181,18 @@ func newSetOptionEnabledHandler(option NetworkRuleOption, enabled bool) (handler
 // value and sets permitted and restricted dns types.  r must not be nil.
 func setDNSTypeOptionHandler(r *NetworkRule, value string) (err error) {
 	permitted, restricted, err := parseDNSTypes(value)
-	r.permittedDNSTypes = permitted
-	r.restrictedDNSTypes = restricted
+	if err != nil {
+		// Don't wrap the error, because it's informative enough as is.
+		return err
+	}
 
-	// Don't wrap the error, because it's informative enough as is.
-	return err
+	if len(permitted) > 0 || len(restricted) > 0 {
+		m := r.ensureModifiers()
+		m.permittedDNSTypes = permitted
+		m.restrictedDNSTypes = restricted
+	}
+
+	return nil
 }
 
 // setDNSRewriteOptionHandler is an [optionHandler] that parses dnsrewrite value
@@ -1135,15 +1210,22 @@ func setDNSRewriteOptionHandler(r *NetworkRule, value string) (err error) {
 // permitted and restricted domains.  r must not be nil.
 func setDomainOptionHandler(r *NetworkRule, value string) (err error) {
 	permitted, restricted, err := parseDomains(value, "|")
-	r.permittedDomains = permitted
-	r.restrictedDomains = restricted
+	if err != nil {
+		// Don't wrap the error, because it's informative enough as is.
+		return err
+	}
 
-	// Don't wrap the error, because it's informative enough as is.
-	return err
+	if len(permitted) > 0 || len(restricted) > 0 {
+		m := r.ensureModifiers()
+		m.permittedDomains = permitted
+		m.restrictedDomains = restricted
+	}
+
+	return nil
 }
 
 // setDenyallowOptionHandler is an [optionHandler] that parses domains and sets
-// [NetworkRule.denyAllowDomains].  r must not be nil.
+// [networkRuleModifiers.denyAllowDomains].  r must not be nil.
 func setDenyAllowOptionHandler(r *NetworkRule, value string) (err error) {
 	permitted, restricted, err := parseDomains(value, "|")
 	if err != nil {
@@ -1155,7 +1237,7 @@ func setDenyAllowOptionHandler(r *NetworkRule, value string) (err error) {
 		return fmt.Errorf("invalid $denyallow value: %q", value)
 	}
 
-	r.denyAllowDomains = permitted
+	r.ensureModifiers().denyAllowDomains = permitted
 
 	return nil
 }
@@ -1165,8 +1247,9 @@ func setDenyAllowOptionHandler(r *NetworkRule, value string) (err error) {
 func setCTagOptionHandler(r *NetworkRule, value string) (err error) {
 	permitted, restricted, err := parseCTags(value, "|")
 	if err == nil {
-		r.permittedClientTags = permitted
-		r.restrictedClientTags = restricted
+		m := r.ensureModifiers()
+		m.permittedClientTags = permitted
+		m.restrictedClientTags = restricted
 	}
 
 	// Don't wrap the error, because it's informative enough as is.
@@ -1178,8 +1261,9 @@ func setCTagOptionHandler(r *NetworkRule, value string) (err error) {
 func setClientOptionHandler(r *NetworkRule, value string) (err error) {
 	permitted, restricted, err := parseClients(value, '|')
 	if err == nil {
-		r.permittedClients = permitted
-		r.restrictedClients = restricted
+		m := r.ensureModifiers()
+		m.permittedClients = permitted
+		m.restrictedClients = restricted
 	}
 
 	// Don't wrap the error, because it's informative enough as is.
@@ -1215,10 +1299,11 @@ func setRespGeoOptionHandler(r *NetworkRule, value string) (err error) {
 		idx++
 	}
 
-	r.permittedASNs = container.NewSortedSliceSet(data.permittedASNs...)
-	r.permittedCountries = container.NewSortedSliceSet(data.permittedCountries...)
-	r.restrictedASNs = container.NewSortedSliceSet(data.restrictedASNs...)
-	r.restrictedCountries = container.NewSortedSliceSet(data.restrictedCountries...)
+	m := r.ensureModifiers()
+	m.permittedASNs = container.NewSortedSliceSet(data.permittedASNs...)
+	m.permittedCountries = container.NewSortedSliceSet(data.permittedCountries...)
+	m.restrictedASNs = container.NewSortedSliceSet(data.restrictedASNs...)
+	m.restrictedCountries = container.NewSortedSliceSet(data.restrictedCountries...)
 
 	return nil
 }

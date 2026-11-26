@@ -300,11 +300,27 @@ func TestParseCTags(t *testing.T) {
 func TestNetworkRule_cTagRules(t *testing.T) {
 	t.Parallel()
 
+	t.Run("plain_rule_no_modifiers", func(t *testing.T) {
+		t.Parallel()
+
+		plain := newNetworkRule(t, "||example.org^")
+		assert.Nil(t, plain.modifiers)
+
+		badPlain := newNetworkRule(t, "||example.org^$badfilter")
+		assert.Nil(t, badPlain.modifiers)
+		assert.True(t, badPlain.negatesBadfilter(plain))
+
+		badWithDomain := newNetworkRule(t, "||example.org^$badfilter,domain=a.org")
+		assert.NotNil(t, badWithDomain.modifiers)
+		assert.False(t, badWithDomain.negatesBadfilter(plain))
+	})
+
 	t.Run("permitted_one", func(t *testing.T) {
 		t.Parallel()
 
 		r := newNetworkRule(t, "||test.example^$ctag=pc")
-		assert.Equal(t, []string{"pc"}, r.permittedClientTags.Values())
+		require.NotNil(t, r.modifiers)
+		assert.Equal(t, []string{"pc"}, r.modifiers.permittedClientTags.Values())
 
 		req := NewRequestForHostname("test.example")
 		req.ClientTags = container.NewSortedSliceSet("pc")
@@ -318,7 +334,8 @@ func TestNetworkRule_cTagRules(t *testing.T) {
 		t.Parallel()
 
 		r := newNetworkRule(t, "||test.example^$ctag=phone|pc")
-		assert.Equal(t, []string{"pc", "phone"}, r.permittedClientTags.Values())
+		require.NotNil(t, r.modifiers)
+		assert.Equal(t, []string{"pc", "phone"}, r.modifiers.permittedClientTags.Values())
 
 		req := NewRequestForHostname("test.example")
 		req.ClientTags = container.NewSortedSliceSet("phone", "other")
@@ -332,8 +349,9 @@ func TestNetworkRule_cTagRules(t *testing.T) {
 		t.Parallel()
 
 		r := newNetworkRule(t, "||test.example^$ctag=~phone|pc")
-		assert.Equal(t, []string{"pc"}, r.permittedClientTags.Values())
-		assert.Equal(t, []string{"phone"}, r.restrictedClientTags.Values())
+		require.NotNil(t, r.modifiers)
+		assert.Equal(t, []string{"pc"}, r.modifiers.permittedClientTags.Values())
+		assert.Equal(t, []string{"phone"}, r.modifiers.restrictedClientTags.Values())
 
 		req := NewRequestForHostname("test.example")
 		req.ClientTags = container.NewSortedSliceSet("phone", "pc")
